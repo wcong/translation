@@ -85,4 +85,68 @@ leader决定日志实体对状态机来说是否安全；这样的实体被称�
 
 因为这种机制，leader在当选时不需要做任何特殊的操作来恢复日志的一致性。这只是普通的操作，日志会在AppendEntries的失败的一致性检测，逐步实现一致性。leader不会覆盖或删除自己的日志（图表3中的leader的只追加属性）
 
-这种日志复制机制展示了第二张的明智的一致性属性：raft可以接受，复制，出路新的日志实体只要大部分server存活；正常情况下，新的日志实体会在一轮简单的RPC请求中完成复制；而且一个慢的follower不会影响整体性能。
+这种日志复制机制展示了第二张的明智的一致性属性：raft可以接受，复制，处理新的日志实体只要大部分server存活；正常情况下，新的日志实体会在一轮简单的RPC请求中完成复制；而且一个慢的follower不会影响整体性能。
+
+#### 5.4 安全
+前面的章节描述了raft怎么选举leader，复制日志。然而，到现在为止都没有足够的描述怎么保证每一个状态机以相同的顺序执行相同的命令。比如，一个follower在一段时间不可用，这段时间leader提交了几个日志，然后等follower恢复后，leader宕机了，这个follower成为了新的leader，会把别的server的日志覆盖掉。这样不同的状态机就执行了不同的命令。
+
+这章完整了raft算法，它添加了一个限制，哪一个server可以被选为leader。这个限制保证了leader包含了以前term的所有日志实体（图表3的leader完整属性），因为选举限制，提交的规则就更明确了，最终我们为leader完整属性提出了一个简要的证明，并展示了它怎么指导复制状态机正确的运行。
+
+##### 5.4.1 选举限制
+在任何一个leader-base的一致性算法中，leader必须保存所有完整的提交的日志。在一些一致性算法中，比如Viewstamped Replication，即使这个节点没有保存所有的日志实体，他也会被选为leader。这些算法包含一些特殊的机制来识别丢失的实体，并把它们发送到新的leader，在选举过程中，或者当选leader的短时间内。但是这样会增加额外的机制和复杂度。raft使用了一个简单的实现，来保证所有以前term提交的日志实体会在每一个被选举的candidate中，不需要在传送实体给leader了，这就意味着日志实体只会从leader传输到follower，leader从不会覆盖自己的日志。
+
+![图表8](./figure8.png)
+
+图表8：时间线展示了为什么leader不能通过以前的日志实体决定是否提交。在（a）S1是一个leader，并部分的复制了index2的日志实体。在（b）S1当机了；S5在term3中接受了S3，S4，和自己的投票成为了新的leader，并接受了新的日志实体，放在index2中。在（c）S5宕机了。S1恢复了作为新的leader，继续复制日志。在这点上term2的日志实体已经被复制到大多数server上，但是还没提交。如果S1宕机了（b）。S5可能会重新当选leader（S2，S3，S4的投票），然后把它在term3的实体覆盖带其他server。然而，如果s2在宕机前把它的日志复杂到大多数的server上（e），然后实体被提交了（s5不能赢得选举）。这样日子里面所有以前的实体也都被提交了。
+
+raft使用选举过程来保证只有一个candidate包含了完整的日志实体才能被选为leader。candidate必须联系大多数的server才能赢得选举。这就意味着每一个提交的日志实体必须在其中一个server中找到。如果一个candidate至少跟大多数其他的server一样up-to-date（up-to-date在底下被精确的描述了），这样它就会保存真完整的日志。RequestEntries RPC 实现了这个限制：RPC包好了candidate的日志信息，投票人如果发现自己的日志比candidate更up-to-date
+
+raft通过比较两个日志的最近实体的term和index值来判断谁更up-to-date。如果日子最近的实体在不同的term，那个term值最大的，更up-to-date。如果log的term值一样，那么所得日志做多，谁更up-to-date。
+
+##### 5.4.2 以前term的提交的实体
+正如5.3章描述的leader通过实体被保存在大多数的server上知道一个实体被提交了。如果leader在完成提交实体前宕机了。未来的leader会继续尝试完成复制实体。然而，leader不可能立刻得知以前term的日志实体被提交了，直到大多数保存在大多数的server中。图表8展示了即使日志实体被存在大多数的serber上，仍然可能会被未来的leader覆盖掉。
+
+为了消除类似图表8中的问题，raft判断以前实体的是否提交，不通过统计复制数。只有leader的当前term的日志实体，采用统计复制数老判断是否提交。一旦一个当前term的实体被提交了，那么所有所有以前的实体都被提交了。因为日志匹配属性。有些情况leader可以安全的判断一个老的实体是否被提交（比如，实体被存在所有的server上了）但是raft为了简单采用了更保守的方法。
+
+raft提交规则上引起了这一个额外的复杂情况，因为当leader复制以前的实体的时候，日志实体保留它的原始的term值。在其他一致性算法中，如果新的leader从以前的term中复制实体，会给他分配一个新的“term 值”。raft因为日志实体的原因的是它更简单，因为他们在不同的term和不同的日志中保存一样的term值。此外，对比其他算法，新的leader发送更少的以前term的日志实体（其他算法必须在提交他们前，提交多余的日志来重新编码他们）
+
+##### 5.4.3 安全讨论
+通过完整的算法，我们现在可以更清晰的讨论leader完成属性（这个讨论基于安全证明，见9，2章）的保持。我们假设leader完成属性没有保存，然后我们证明一个矛盾。假设leader在term T中提交了一个当前term的实体，但是未来的一些leader没有保存这些日志。假设最小的term U（U>T），U中的leader没有保存这个实体：
+
+1. 在leader U 选举的时候，leader U的日志里一定少提交的日志实体（leader不可能删除或则覆盖实体）
+2. leader T 在集群的大多数的server都负责了这个实体，leader U 得到了大多数的server的选票。所以至少有一个投票的server收到了leader T复制的日子，如图表9战士的。投票人是证明矛盾的关键。
+3. 投票server在给leader U投票前一定收到了leader T的日志实体；否则它会拒接leader T的 AppendEntries请求（他的当前term比T高）。
+4. 投票server在给leader U投票时仍然保存的实体，因为任何一个介入的leader都保存的这个实体（推断），leader不会删除实体，follower只会在和leader冲突时才会删除实体。
+5. 投票server给leader U 投票，所以leader U的日志必须和投票的server up-to-date。这个leader是两个矛盾中的其中一个。
+6. 首先，如果voter和leader的term值相同，leader U的日志至少可voter得日志一样长，所以leader的日志保存着voter的每一个日志。这是一个矛盾，因为voter保存着提交的日志实体，但是leader U本来不会保存着。
+7. 或则，leader U的最后的log term比voter 大。此外，他比T的log大，因为voter的最后的日志实体至少比T大（它保留在term T的每一个实体）。leader U的前一个leader（同样大于T）的最后的日志实体一定保存这个实体（推断）。这是，通过日志匹配属性，leader U的日志也一定保存的提交的日志实体，这也是一个矛盾。
+8. 这是完整的矛盾。因此，term大于T的所有的leader一定保存着term T提交的所有实体。
+9. Log Matching Property 间接的保证了未来的leader也保存着所有提交的日志，图表8（d）的index 2。
+
+因为 Leader Completeness Property，我们可以证明 图表3的 State Machine Safety 属性，也就是说如果一个server在一个index上提交了一个日志实体给状态机，其他的server不可能在相同的index提交一个不同的log。当一个server提交了一个日志给他的状态机，他的日志一定跟leader的日志相同（通过这个实体），而且这个实体一定被提交了。现在考虑所有的server的log index 的最低的term；Log Completeness Property 保证了所有高term的leader都保存了相同的日志实体，所以上一个term的server提交的日志实体是相通的。因此，State Machine Property证明了。
+
+最后，raft要求server以index的顺序提交日志实体。又因为 State Machine Safety Property，这意味着所有的server都会以相同的顺序向状态机提交相同的日志实体。
+
+#### 5.5 follower或者candidate 宕机
+但现在为止我们一直讨论leader的宕机。candidate和follower的宕机比leader得宕机更好处理，candidate和follower的处理方式相同。如果follower或者candidate宕机了，未来的 RequestVote 和AppendEntries RPC，会相应失败。raft通过无限期的重试来处理这种情况；如果宕机的server恢复了，rpc会成功完成。如果server在宕机前已经处理了所有的请求，但没有发送相应，他会收到过一个相同的rpc在它重启之后。raft的rpc事等幂的，所以这不会造成问题。比如，如果一个follower收到了一个AppendEntries，里面包含自己日志里有的日志，他会在新的请求中忽略它。
+
+#### 5.6 定时器和可用性
+我们其中的一个要求是，raft的安全性不能依赖定时器：系统不能因为一些事件比预期发生的快慢就产生错误的结果。然而可用性（系统相应client的请求的能力的时间的表示方式）必须依赖定时器。比如，server宕机，信息的交换超过了正常的时间，candidate就不能有足够的时间赢得选举；没有一个稳定的leader，raft不能处理请求
+
+leader的选取是表明了定时器是很关键的，对于raft来说。raft不能选举或者保持一个稳定的leader，知道系统满足了下面的定时器的要求：
+
+**broadcastTime<< electionTimeout<< MTBF**
+
+在这个不等式中，**broadcastTime**是server并行的发送rpc请求并收到相应的平均时间；electionTimeout是5.2章描述的选举时间；MTBF是一个server宕机的平均时间。broadcast时间不许比选举超时的时间少一个量级，这样leader才能稳定的发送心跳信息，是follower不发起新的选举；因为选举超时时间的随机性，这个不等式也是选票分裂和罕见。选举超时的时间也要比MTBF的时间少几个数量级，这样系统才会有个平稳的过度。当leader当机了，系统会不可用大约一个选举超时的时间；我们希望这只代表一小部分时间。
+
+broadcastTime和MTBF是系统的基本属性（没法控制），electionTimeout是我们可控制的。raft的rpc要求稳定的信息的存储，所以broadcastTime，大约在0.5ms到20ms之间，依赖于存储技术了。所以electionTimeout可能在10ms和500ms之间。正常来讲server的MTBFs是几个月或者更多，这很容易满足时间要求。
+
+
+
+
+
+
+
+
+
+
